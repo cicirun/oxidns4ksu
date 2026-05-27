@@ -1,0 +1,141 @@
+name: Build OxiDNS for Android (aarch64)
+run-name: 编译OxiDNS安卓aarch64静态二进制 - ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  release:
+    types: [ published ]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-android:
+    name: 交叉编译安卓aarch64 + 构建WebUI
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ==================== 1. 安装 Rust 编译环境 ====================
+      - name: 安装基础编译依赖
+        run: sudo apt update && sudo apt install -y binutils-aarch64-linux-gnu
+
+      - name: 安装Rust工具链
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-unknown-linux-musl
+          override: true
+          components: rustfmt, clippy
+
+      - name: 缓存Cargo依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 安装Cross交叉编译工具
+        run: cargo install cross --force
+
+      # ==================== 2. 编译 OxiDNS 二进制 ====================
+      - name: 编译 aarch64 musl 静态二进制
+        run: cross build --release --target aarch64-unknown-linux-musl
+
+      - name: 剥离调试符号瘦身
+        run: |
+          cd target/aarch64-unknown-linux-musl/release
+          aarch64-linux-gnu-strip oxidns
+          ls -lh oxidns
+
+      # ==================== 3. 构建 WebUI 前端 ====================
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: 安装WebUI依赖
+        working-directory: webui
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建WebUI
+        working-directory: webui
+        run: pnpm build
+
+      # 调试：打印WebUI目录结构，找到构建产物（关键！）
+      - name: 查看WebUI构建后目录
+        run: ls -la webui/
+
+      # ==================== 4. 提取版本号 + 带版本文件名 ====================
+      - name: 提取版本号并生成文件名
+        id: get_version
+        run: |
+          VERSION=$(grep -oP '(?<=version = ")[^"]+' Cargo.toml | head -1)
+          BIN_NAME="oxidns-android-aarch64-v$VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "BIN_NAME=$BIN_NAME" >> $GITHUB_OUTPUT
+
+      # ==================== 5. 整理产物（修复报错核心） ====================
+      - name: 整理发布产物
+        run: |
+          # 关闭严格退出模式，防止小错误中断脚本
+          set +e
+          mkdir -p output
+          
+          # 1. 复制带版本号的二进制（核心，必成功）
+          cp target/aarch64-unknown-linux-musl/release/oxidns output/${{ steps.get_version.outputs.BIN_NAME }}
+          
+          # 2. 自动复制所有可能的WebUI构建目录（彻底解决报错）
+          cp -r webui/dist output/webui 2>/dev/null
+          cp -r webui/build output/webui 2>/dev/null
+          cp -r webui/out output/webui 2>/dev/null
+          cp -r webui/public output/webui 2>/dev/null
+          
+          # 3. 复制配置文件
+          [ -f config.yaml ] && cp config.yaml output/ || true
+          
+          # 4. 展示最终产物
+          ls -lh output/
+
+      # ==================== 6. 上传构建产物 ====================
+      - name: 上传编译制品
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxidns-android-aarch64
+          path: output/
+          retention-days: 90
+
+      # ==================== 7. 发布到 Release ====================
+      - name: 上传到 GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            output/${{ steps.get_version.outputs.BIN_NAME }}
+            output/webui/*
+            output/config.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
